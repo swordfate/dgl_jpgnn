@@ -754,6 +754,44 @@ void BuildCsr(const ImmutableGraph &g, const std::string neigh_type) {
 }
 
 template<typename ValueType>
+std::vector<NodeFlow> NeighborSamplingImplWithDiffBatchSz(const ImmutableGraphPtr gptr,
+                                           const IdArray seed_nodes,
+                                           const int64_t batch_start_id,
+                                           const NDArray batch_offsets,
+                                           const int64_t max_num_workers,
+                                           const int64_t expand_factor,
+                                           const int64_t num_hops,
+                                           const std::string neigh_type,
+                                           const bool add_self_loop,
+                                           const ValueType *probability) {
+    // process args
+    CHECK(aten::IsValidIdArray(seed_nodes));
+    const dgl_id_t* seed_nodes_data = static_cast<dgl_id_t*>(seed_nodes->data);
+    const int64_t* batch_offsets_data = static_cast<int64_t*>(batch_offsets->data);
+    const int64_t num_seeds = seed_nodes->shape[0];
+    const int64_t num_workers = std::min(max_num_workers,
+        batch_offsets->shape[0] - 1 - batch_start_id);
+    // We need to make sure we have the right CSR before we enter parallel sampling.
+    BuildCsr(*gptr, neigh_type);
+    // generate node flows
+    std::vector<NodeFlow> nflows(num_workers);
+#pragma omp parallel for
+    for (int i = 0; i < num_workers; i++) {
+      // create per-worker seed nodes.
+      const int64_t start = batch_offsets_data[batch_start_id + i];
+      const int64_t end = std::min(batch_offsets_data[batch_start_id + i + 1], num_seeds);
+      // TODO(minjie): the vector allocation/copy is unnecessary
+      std::vector<dgl_id_t> worker_seeds(end - start);
+      std::copy(seed_nodes_data + start, seed_nodes_data + end,
+                worker_seeds.begin());
+      nflows[i] = SamplerOp::NeighborSample(
+          gptr.get(), worker_seeds, neigh_type, num_hops, expand_factor,
+          add_self_loop, probability);
+    }
+    return nflows;
+}
+
+template<typename ValueType>
 std::vector<NodeFlow> NeighborSamplingImpl(const ImmutableGraphPtr gptr,
                                            const IdArray seed_nodes,
                                            const int64_t batch_start_id,
@@ -809,6 +847,55 @@ DGL_REGISTER_GLOBAL("sampling._CAPI_UniformSampling")
     std::vector<NodeFlow> nflows = NeighborSamplingImpl<float>(
         gptr, seed_nodes, batch_start_id, batch_size, max_num_workers,
         expand_factor, num_hops, neigh_type, add_self_loop, nullptr);
+
+    *rv = List<NodeFlow>(nflows);
+  });
+
+DGL_REGISTER_GLOBAL("sampling._CAPI_NeighborSamplingWithDiffBatchSz")
+.set_body([] (DGLArgs args, DGLRetValue* rv) {
+    // arguments
+    const GraphRef g = args[0];
+    const IdArray seed_nodes = args[1];
+    const int64_t batch_start_id = args[2];
+    const NDArray batch_offsets = args[3];
+    const int64_t max_num_workers = args[4];
+    const int64_t expand_factor = args[5];
+    const int64_t num_hops = args[6];
+    const std::string neigh_type = args[7];
+    const bool add_self_loop = args[8];
+    const NDArray probability = args[9];
+
+    auto gptr = std::dynamic_pointer_cast<ImmutableGraph>(g.sptr());
+    CHECK(gptr) << "sampling isn't implemented in mutable graph";
+
+    std::vector<NodeFlow> nflows;
+
+    CHECK(probability->dtype.code == kDLFloat)
+      << "transition probability must be float";
+    CHECK(probability->ndim == 1)
+      << "transition probability must be a 1-dimensional vector";
+
+    ATEN_FLOAT_TYPE_SWITCH(
+      probability->dtype,
+      FloatType,
+      "transition probability",
+      {
+        const FloatType *prob;
+
+        if (probability->ndim == 1 && probability->shape[0] == 0) {
+          prob = nullptr;
+        } else {
+          CHECK(probability->shape[0] == gptr->NumEdges())
+            << "transition probability must have same number of elements as edges";
+          CHECK(probability.IsContiguous())
+            << "transition probability must be contiguous tensor";
+          prob = static_cast<const FloatType *>(probability->data);
+        }
+
+        nflows = NeighborSamplingImplWithDiffBatchSz(
+            gptr, seed_nodes, batch_start_id, batch_offsets, max_num_workers,
+            expand_factor, num_hops, neigh_type, add_self_loop, prob);
+    });
 
     *rv = List<NodeFlow>(nflows);
   });
